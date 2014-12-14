@@ -1,23 +1,38 @@
 (ns drop.core
   (:require [om.core :as om :include-macros true]
             [cljs.reader :as reader]
-            [sablono.core :as html :refer-macros [html]]))
+            [sablono.core :as html :refer-macros [html]]
+            [cljs-webgl.context :as context]
+            [cljs-webgl.shaders :as shaders]
+            [cljs-webgl.constants.draw-mode :as draw-mode]
+            [cljs-webgl.constants.data-type :as data-type]
+            [cljs-webgl.constants.buffer-object :as buffer-object]
+            [cljs-webgl.constants.shader :as shader]
+            [cljs-webgl.buffers :as buffers]
+            [cljs-webgl.typed-arrays :as ta]))
 
-(defn random-color
+(defn str-color
+  [c]
+  (apply str "#" (map #(.toString (int (* 255 %)) 16) (take 3 c))))
+
+(defn random-glcolor
   []
-  (apply str "#" (map #(.toString % 16) (take 3 (repeatedly #(rand-int 16))))))
+  [(rand) (rand) (rand) 1.0])
 
 (defn random-ball
   []
-  {:p [(+ 50 (rand-int 500)) (+ 50 (rand-int 500))]
-   :v [(- 500 (rand-int 1000)) (- 500 (rand-int 1000))]
-   :color (random-color)
-   :r (rand-int 30)
-   :bouncy (+ 0.5 (/ (rand) 2)) }
+  (let [c (random-glcolor)]
+    {:p [(+ 50 (rand-int 500)) (+ 50 (rand-int 500))]
+     :v [(- 500 (rand-int 1000)) (- 500 (rand-int 1000))]
+     :color (str-color c)
+     :c c
+     :r (rand-int 30)
+     :bouncy (+ 0.5 (/ (rand) 2)) })
   )
 
 (defonce app-state (atom {:text "Bouncyness!"
                           :time 0
+                          :frame 0
                           :gravity 980
                           :balls #_[{:v [500 0]
                                    :p [100 100]
@@ -179,7 +194,7 @@
   )
 
 (defn step
-  [delta-t {:keys [gravity time balls] :as sim}]
+  [delta-t {:keys [gravity time frame balls] :as sim}]
   (let [balls' (mapv (fn [b]
                      (-> b
                          (accelerate-g gravity delta-t)
@@ -189,17 +204,228 @@
                          (collide-right-wall 550))) balls)]
     (assoc sim
            :time (+ delta-t time)
+           :frame (inc frame)
            :balls (mapv (fn [b]
                           (-> b
                               (collide-balls (remove #(= b %) balls')))) balls')) 
     )
   )
 
+(def a-vertex-shader-source
+    "attribute vec3 a_vertex_position;
+     attribute vec2 a_texCoord;
+     uniform vec3 u_resolution;
+     varying vec2 v_texCoord;
+       void main() {
+        vec3 vp = a_vertex_position;
+        vec3 zeroToOne = vp / u_resolution;
+        vec3 zeroToTwo = zeroToOne * 2.0;
+        vec3 vertex_position = zeroToTwo - 1.0;
+
+        gl_Position = vec4(vertex_position, 1);
+        v_texCoord = a_texCoord;
+       }")
+
+
+(def vertex-shader-source
+    "attribute vec3 a_vertex_position;
+     attribute vec2 a_texCoord;
+     uniform vec3 a_center;
+     uniform vec3 u_resolution;
+     varying vec2 v_texCoord;
+       void main() {
+        vec3 vp = a_vertex_position + a_center;
+        vec3 zeroToOne = vp / u_resolution;
+        vec3 zeroToTwo = zeroToOne * 2.0;
+        vec3 vertex_position = zeroToTwo - 1.0;
+
+        gl_Position = vec4(vertex_position, 1);
+        v_texCoord = a_texCoord;
+       }")
+
+(def fragment-shader-source
+    "uniform int frame;
+       void main() {
+         gl_FragColor.r = sin(float(frame) * 0.05) / 2.0 + 0.5;
+         gl_FragColor.g = sin(float(frame) * 0.1) / 2.0 + 0.5;
+         gl_FragColor.b = sin(float(frame) * 0.02) / 2.0 + 0.5;
+         gl_FragColor.a = 1.0;
+            }")
+
+(def circle-fragment-source
+  "
+  precision mediump float;
+  uniform float a_radius;
+  uniform vec4 a_color;
+  varying vec2 v_texCoord;
+  void main () {
+    float border = 0.01;
+    vec3 border_color = vec3(0.0, 0.0, 0.0);
+    vec2 circle_center = vec2(0.5, 0.5);
+
+    float dist = distance(v_texCoord, circle_center);
+
+    if (dist <= a_radius) {
+      if (dist < (a_radius - border)) {
+         gl_FragColor = a_color;
+      } else {
+         gl_FragColor = vec4(border_color, (a_radius - dist) * 100.0);
+      }
+    } else {
+      discard;
+    }
+  }
+  "
+  )
+
+(def grid-fragment-source
+  "precision mediump float;
+   varying vec2 v_texCoord;
+   void main () {
+     vec2 origin = vec2(180.0, 520.0);
+     float range = 1000.0;
+     float grid_size = 100.0;
+     vec2 wc = (v_texCoord * range) + origin;
+     vec2 sc = mod(wc, grid_size) / grid_size;
+
+     if (wc.x <= 100.0) {
+        gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+     } else {
+        float r = 0.0;
+        if (sc.x <= 0.01 || sc.x >= 0.99) {
+           r = 1.0;
+        }
+        if (sc.y <= 0.01 || sc.y >= 0.99) {
+           r = 1.0;
+        }
+        gl_FragColor = vec4(r, 0.0, 0.0, 1.0);
+     }
+   }
+  "
+  )
+
+(defn draw-grid-fn
+  [gl w h]
+  (let [vertex-buffer  (buffers/create-buffer gl  (ta/float32  [w h 0.0
+                                                                0.0 h 0.0
+                                                                w 0.0 0.0
+                                                                0.0 h 0.0
+                                                                0.0 0.0 0.0
+                                                                w 0.0 0.0])
+                                              buffer-object/array-buffer
+                                              buffer-object/static-draw)
+        tex-buffer  (buffers/create-buffer gl  (ta/float32  [1.0 1.0
+                                                             0.0 1.0
+                                                             1.0 0.0
+                                                             0.0 1.0
+                                                             0.0 0.0
+                                                             1.0 0.0])
+                                           buffer-object/array-buffer
+                                           buffer-object/static-draw)
+        element-buffer  (buffers/create-buffer gl (ta/unsigned-int16  [0 1 2 3 4 5])
+                                               buffer-object/element-array-buffer
+                                               buffer-object/static-draw)]
+    (fn  []
+      (let [shader  (shaders/create-program gl
+                                            (shaders/create-shader gl shader/vertex-shader a-vertex-shader-source)
+                                            (shaders/create-shader gl shader/fragment-shader grid-fragment-source))]
+        (buffers/draw! gl
+                       :shader shader
+                       :draw-mode draw-mode/triangles
+                       :count 6
+
+                       :attributes
+                       [{:buffer vertex-buffer
+                         :location  (shaders/get-attrib-location gl shader "a_vertex_position")
+                         :components-per-vertex 3
+                         :type data-type/float}
+                        {:buffer tex-buffer
+                         :location  (shaders/get-attrib-location gl shader "a_texCoord")
+                         :components-per-vertex 2
+                         :type data-type/float}]
+
+                       :uniforms
+                       [{:name "u_resolution" :type :vec3 :values (ta/float32 [600.0 600.0 1.0])}
+                        ]
+                       :element-array
+                       {:buffer element-buffer
+                        :count 3
+                        :type data-type/unsigned-short
+                        :offset 0})))))
+
+(defn init-gl  [canvas]
+  (let
+    [gl  (context/get-context  canvas)
+     grid-fn (draw-grid-fn gl 600 600)
+     vertex-buffer  (buffers/create-buffer gl  (ta/float32  [100.0 100.0 0.0
+                                                             -100.0 100.0 0.0
+                                                             100.0 -100.0 0.0
+                                                             -100.0 100.0 0.0
+                                                             -100.0 -100.0 0.0
+                                                             100.0 -100.0 0.0])
+                                           buffer-object/array-buffer
+                                           buffer-object/static-draw)
+     tex-buffer  (buffers/create-buffer gl  (ta/float32  [1.0 1.0
+                                                          0.0 1.0
+                                                          1.0 0.0
+                                                          0.0 1.0
+                                                          0.0 0.0
+                                                          1.0 0.0])
+                                           buffer-object/array-buffer
+                                           buffer-object/static-draw)
+     element-buffer  (buffers/create-buffer gl  (ta/unsigned-int16  [0 1 2 3 4 5])
+                                            buffer-object/element-array-buffer
+                                            buffer-object/static-draw)
+     draw  (fn  [balls]
+             (let [shader  (shaders/create-program gl
+                                                    (shaders/create-shader gl shader/vertex-shader vertex-shader-source)
+                                                    (shaders/create-shader gl shader/fragment-shader circle-fragment-source))]
+               (-> gl
+                 (buffers/clear-color-buffer 1 1 1 1))
+               (grid-fn)
+               #_(doseq [{:keys [p r c]} balls]
+                 (buffers/draw! gl :shader shader
+                                :draw-mode draw-mode/triangles
+                                :count 6
+
+                                :attributes
+                                [{:buffer vertex-buffer
+                                  :location  (shaders/get-attrib-location gl shader "a_vertex_position")
+                                  :components-per-vertex 3
+                                  :type data-type/float}
+                                 {:buffer tex-buffer
+                                  :location  (shaders/get-attrib-location gl shader "a_texCoord")
+                                  :components-per-vertex 2
+                                  :type data-type/float}]
+
+                                :uniforms
+                                [{:name "u_resolution" :type :vec3 :values (ta/float32 [600.0 600.0 1.0])}
+                                 {:name "a_center" :type :vec3 :values (ta/float32 [(p 0) (- 600 (p 1)) 0.0])}
+                                 {:name "a_radius" :type :float :values (ta/float32 [(/ r 200.0)])}
+                                 {:name "a_color" :type :vec4 :values (ta/float32 c)}
+                                 ]
+
+                                :element-array
+                                {:buffer element-buffer
+                                 :count 3
+                                 :type data-type/unsigned-short
+                                 :offset 0})
+                 )
+               ))]
+    draw))
+
+
 
 (defn main []
   (om/root
     (fn [app owner]
       (reify
+        om/IDidMount
+        (did-mount [_]
+          (let [d (init-gl (om/get-node owner "gl"))]
+            (om/set-state! owner :gl-draw d)
+            (d (:balls app))
+            ))
         om/IRender
         (render [_]
           (html/html
@@ -207,6 +433,7 @@
             [:h1 (:text app)]
             [:div
              [:h2 (str "Time " (:time app))]
+             [:h3 (str "FPS " (/ (:frame app) (:time app)))]
              [:table
               [:tr
                [:td "Bouncy"]
@@ -216,13 +443,25 @@
                              :step 0.01
                              :value (get-in app [:ball 0 :bouncy])
                              :on-change (fn [e]
-                                          (om/update! app [:ball 0 :bouncy] (reader/read-string (.. e -target -value))))}]]]]
+                                          (om/update! app [:ball 0 :bouncy] (reader/read-string (.. e -target -value))))}]]]
+              [:tr
+               [:td "Gravity"]
+               [:td [:input {:type "number"
+                             :min 0
+                             :max 10000
+                             :step 10
+                             :value (:gravity app)
+                             :on-change (fn [e]
+                                          (om/update! app :gravity (reader/read-string  (.. e -target -value))))}]]]]
              [:button {:on-click (fn [_]
                                    (om/transact! app (partial step 0.001)))} "click"]
              [:button {:on-click (fn [_]
                                    (let [i (.setInterval js/window
                                                          (fn []
-                                                           (om/update! app (step 0.01 @app)))
+                                                           (let [app' (step 0.01 @app)]
+                                                             (om/update! app app')
+                                                             (if-let [d (om/get-state owner :gl-draw)]
+                                                               (d (:balls app')))))
                                                          10)]
                                      (om/set-state! owner :interval i)))} "run"]
              [:button {:on-click (fn [_]
@@ -239,13 +478,15 @@
                                    (om/transact! app [:balls]
                                      #(conj % (random-ball))))} "add"]
              ]
-            [:svg {:width 600 :height 600}
-             (map (fn [b]
-                    [:circle {:cx (-> b :p first)
-                              :cy (-> b :p second)
-                              :r (-> b :r)
-                              :fill (-> b :color)
-                              :stroke "black"}]) (:balls app))]]))))
+            [:div
+             [:canvas {:width 600 :height 600 :float "right" :ref "gl"}]
+             [:svg {:width 600 :height 600}
+              (map (fn [b]
+                     [:circle {:cx (-> b :p first)
+                               :cy (-> b :p second)
+                               :r (-> b :r)
+                               :fill (-> b :color)
+                               :stroke "black"}]) (:balls app))]]]))))
     app-state
     {:target (. js/document (getElementById "app"))}))
 
@@ -255,4 +496,9 @@
  (.now js/Date)
 
  (.abs js/Math -10)
+
+ (aset js/document "title" "Hi Haters!")
+
+ (. js/document -title)
+
  )
