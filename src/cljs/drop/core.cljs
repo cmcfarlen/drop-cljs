@@ -9,6 +9,8 @@
             [cljs-webgl.constants.buffer-object :as buffer-object]
             [cljs-webgl.constants.shader :as shader]
             [cljs-webgl.buffers :as buffers]
+            [cljs-webgl.constants.capability :as capability]
+            [cljs-webgl.constants.blending-factor-dest :as blending-factor-dest]
             [cljs-webgl.typed-arrays :as ta]))
 
 (defn str-color
@@ -34,6 +36,7 @@
                           :time 0
                           :frame 0
                           :gravity 980
+                          :origin [100.0 100.0]
                           :balls #_[{:v [500 0]
                                    :p [100 100]
                                    :r 10
@@ -231,10 +234,11 @@
     "attribute vec3 a_vertex_position;
      attribute vec2 a_texCoord;
      uniform vec3 a_center;
+     uniform vec2 u_origin;
      uniform vec3 u_resolution;
      varying vec2 v_texCoord;
        void main() {
-        vec3 vp = a_vertex_position + a_center;
+        vec3 vp = a_vertex_position + a_center + vec3(u_origin, 0.0);
         vec3 zeroToOne = vp / u_resolution;
         vec3 zeroToTwo = zeroToOne * 2.0;
         vec3 vertex_position = zeroToTwo - 1.0;
@@ -280,15 +284,16 @@
 
 (def grid-fragment-source
   "precision mediump float;
+   uniform vec2 u_origin;
    varying vec2 v_texCoord;
    void main () {
-     vec2 origin = vec2(180.0, 520.0);
-     float range = 1000.0;
-     float grid_size = 100.0;
-     vec2 wc = (v_texCoord * range) + origin;
+     float range = 600.0;
+     float grid_size = 50.0;
+     vec2 wc = (v_texCoord * range) - u_origin;
      vec2 sc = mod(wc, grid_size) / grid_size;
 
-     if (wc.x <= 100.0) {
+     if ((wc.x <= 1.0 && wc.x >= -1.0) ||
+         (wc.y <= 1.0 && wc.y >= -1.0)) {
         gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
      } else {
         float r = 0.0;
@@ -325,7 +330,7 @@
         element-buffer  (buffers/create-buffer gl (ta/unsigned-int16  [0 1 2 3 4 5])
                                                buffer-object/element-array-buffer
                                                buffer-object/static-draw)]
-    (fn  []
+    (fn  [origin]
       (let [shader  (shaders/create-program gl
                                             (shaders/create-shader gl shader/vertex-shader a-vertex-shader-source)
                                             (shaders/create-shader gl shader/fragment-shader grid-fragment-source))]
@@ -346,7 +351,7 @@
 
                        :uniforms
                        [{:name "u_resolution" :type :vec3 :values (ta/float32 [600.0 600.0 1.0])}
-                        ]
+                        {:name "u_origin" :type :vec2 :values (ta/float32 origin)}]
                        :element-array
                        {:buffer element-buffer
                         :count 3
@@ -376,14 +381,14 @@
      element-buffer  (buffers/create-buffer gl  (ta/unsigned-int16  [0 1 2 3 4 5])
                                             buffer-object/element-array-buffer
                                             buffer-object/static-draw)
-     draw  (fn  [balls]
+     draw  (fn  [balls origin]
              (let [shader  (shaders/create-program gl
                                                     (shaders/create-shader gl shader/vertex-shader vertex-shader-source)
                                                     (shaders/create-shader gl shader/fragment-shader circle-fragment-source))]
                (-> gl
                  (buffers/clear-color-buffer 1 1 1 1))
-               (grid-fn)
-               #_(doseq [{:keys [p r c]} balls]
+               (grid-fn origin)
+               (doseq [{:keys [p r c]} balls]
                  (buffers/draw! gl :shader shader
                                 :draw-mode draw-mode/triangles
                                 :count 6
@@ -400,6 +405,7 @@
 
                                 :uniforms
                                 [{:name "u_resolution" :type :vec3 :values (ta/float32 [600.0 600.0 1.0])}
+                                 {:name "u_origin" :type :vec2 :values (ta/float32 origin)}
                                  {:name "a_center" :type :vec3 :values (ta/float32 [(p 0) (- 600 (p 1)) 0.0])}
                                  {:name "a_radius" :type :float :values (ta/float32 [(/ r 200.0)])}
                                  {:name "a_color" :type :vec4 :values (ta/float32 c)}
@@ -409,12 +415,22 @@
                                 {:buffer element-buffer
                                  :count 3
                                  :type data-type/unsigned-short
-                                 :offset 0})
+                                 :offset 0}
+                                :capabilities {capability/depth-test false capability/blend true}
+                                :blend-function {blending-factor-dest/src-alpha 1}
+                                                   
+                                )
                  )
                ))]
     draw))
 
 
+(defn relative-coord
+  [e]
+  (let [t (.. e -target)
+        r (.getBoundingClientRect t)]
+    [(- (.. e -clientX) (.-left r))
+     (- (.-height t) (- (.. e -clientY) (.-top r)))]))
 
 (defn main []
   (om/root
@@ -424,7 +440,7 @@
         (did-mount [_]
           (let [d (init-gl (om/get-node owner "gl"))]
             (om/set-state! owner :gl-draw d)
-            (d (:balls app))
+            (d (:balls app) (:origin app))
             ))
         om/IRender
         (render [_]
@@ -461,7 +477,7 @@
                                                            (let [app' (step 0.01 @app)]
                                                              (om/update! app app')
                                                              (if-let [d (om/get-state owner :gl-draw)]
-                                                               (d (:balls app')))))
+                                                               (d (:balls app') (:origin app')))))
                                                          10)]
                                      (om/set-state! owner :interval i)))} "run"]
              [:button {:on-click (fn [_]
@@ -472,14 +488,26 @@
                                    (om/transact! app [:balls]
                                      #(mapv (fn [b]
                                               (assoc b
-                                                     :p [50 50]
+                                                     :p [200 50]
                                                      :v [0 0])) %)))} "reset"]
              [:button {:on-click (fn [_]
                                    (om/transact! app [:balls]
                                      #(conj % (random-ball))))} "add"]
              ]
             [:div
-             [:canvas {:width 600 :height 600 :float "right" :ref "gl"}]
+             [:canvas {:width 600
+                       :height 600
+                       :float "right"
+                       :ref "gl"
+                       :on-click (fn [e]
+                                   (let [pt (relative-coord e)]
+                                     (om/update! app :origin pt)
+                                     (if-let [d (om/get-state owner :gl-draw)]
+                                       (d (:balls @app) pt))))
+                       :on-mouse-move (fn [e]
+                                        (when (= 1 (bit-and (.-button e) 1))
+                                          (let [pt (relative-coord e)]
+                                            (om/update! app :origin pt))))}]
              [:svg {:width 600 :height 600}
               (map (fn [b]
                      [:circle {:cx (-> b :p first)
