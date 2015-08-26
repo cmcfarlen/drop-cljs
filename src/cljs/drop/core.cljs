@@ -285,6 +285,9 @@
 (def grid-fragment-source
   "precision mediump float;
    uniform vec2 u_origin;
+   uniform vec4 u_bg_color;
+   uniform vec4 u_grid_color;
+   uniform vec4 u_axis_color;
    varying vec2 v_texCoord;
    void main () {
      float range = 600.0;
@@ -292,18 +295,18 @@
      vec2 wc = (v_texCoord * range) - u_origin;
      vec2 sc = mod(wc, grid_size) / grid_size;
 
+     vec4 c = u_bg_color;
      if ((wc.x <= 1.0 && wc.x >= -1.0) ||
          (wc.y <= 1.0 && wc.y >= -1.0)) {
-        gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        gl_FragColor = u_axis_color;
      } else {
-        float r = 0.0;
         if (sc.x <= 0.01 || sc.x >= 0.99) {
-           r = 1.0;
+           c = u_grid_color;
         }
         if (sc.y <= 0.01 || sc.y >= 0.99) {
-           r = 1.0;
+           c = u_grid_color;
         }
-        gl_FragColor = vec4(r, 0.0, 0.0, 1.0);
+        gl_FragColor = c;
      }
    }
   "
@@ -351,7 +354,10 @@
 
                        :uniforms
                        [{:name "u_resolution" :type :vec3 :values (ta/float32 [600.0 600.0 1.0])}
-                        {:name "u_origin" :type :vec2 :values (ta/float32 origin)}]
+                        {:name "u_origin" :type :vec2 :values (ta/float32 origin)}
+                        {:name "u_bg_color" :type :vec4 :values (ta/float32 [0.8 0.8 0.8 1.0])}
+                        {:name "u_grid_color" :type :vec4 :values (ta/float32 [0.9 0.9 0.9 1.0])}
+                        {:name "u_axis_color" :type :vec4 :values (ta/float32 [1.0 1.0 1.0 1.0])}]
                        :element-array
                        {:buffer element-buffer
                         :count 3
@@ -408,8 +414,7 @@
                                  {:name "u_origin" :type :vec2 :values (ta/float32 origin)}
                                  {:name "a_center" :type :vec3 :values (ta/float32 [(p 0) (- 600 (p 1)) 0.0])}
                                  {:name "a_radius" :type :float :values (ta/float32 [(/ r 200.0)])}
-                                 {:name "a_color" :type :vec4 :values (ta/float32 c)}
-                                 ]
+                                 {:name "a_color" :type :vec4 :values (ta/float32 c)}]
 
                                 :element-array
                                 {:buffer element-buffer
@@ -418,7 +423,6 @@
                                  :offset 0}
                                 :capabilities {capability/depth-test false capability/blend true}
                                 :blend-function {blending-factor-dest/src-alpha 1}
-                                                   
                                 )
                  )
                ))]
